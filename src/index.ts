@@ -5,7 +5,9 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  type CallToolRequest,
 } from "@modelcontextprotocol/sdk/types.js";
+import { createCallLog } from "./call-log.js";
 
 import { ComfyUIClient } from "./comfyui-client.js";
 import { generateImage, generateImageSchema, img2img, img2imgSchema } from "./tools/generate.js";
@@ -1681,8 +1683,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   return { tools: TOOLS };
 });
 
-// Handle tool calls
+// Opt-in diagnostics: COMFYUI_MCP_LOG=<dir> writes one JSONL line per tool call (errors with their
+// stack and ComfyUI's latest execution history), so failures on another machine can be replayed.
+const callLog = createCallLog({
+  dir: process.env.COMFYUI_MCP_LOG,
+  fetchHistory: async () => (await fetch(`${COMFYUI_URL}/history?max_items=1`)).json(),
+});
+// Error per response, not a shared "last error": tool calls can run concurrently.
+const toolErrors = new WeakMap<object, unknown>();
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const started = Date.now();
+  const response = await handleToolCall(request);
+  await callLog.record(request.params.name, request.params.arguments, response, Date.now() - started, toolErrors.get(response));
+  return response;
+});
+
+// Handle tool calls
+async function handleToolCall(request: CallToolRequest) {
   const { name, arguments: args } = request.params;
 
   try {
@@ -2286,12 +2304,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    return {
-      content: [{ type: "text", text: JSON.stringify({ error: message }, null, 2) }],
+    const response = {
+      content: [{ type: "text" as const, text: JSON.stringify({ error: message }, null, 2) }],
       isError: true,
     };
+    toolErrors.set(response, error);
+    return response;
   }
-});
+}
 
 // Start server
 async function main() {
@@ -2299,6 +2319,7 @@ async function main() {
   console.error(`  ComfyUI URL: ${COMFYUI_URL}`);
   console.error(`  Default model: ${COMFYUI_MODEL || "(not set)"}`);
   console.error(`  Output dir: ${COMFYUI_OUTPUT_DIR}`);
+  console.error(`  Call log: ${callLog.enabled ? process.env.COMFYUI_MCP_LOG : "(off)"}`);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
